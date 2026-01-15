@@ -1,111 +1,157 @@
+Вот переработанная версия текста в **строгом, минималистичном и технически точном стиле**, без эмодзи, маркетинговых формулировок и избыточного оформления — с учётом твоих условий: работа на Ubuntu, когнитивные ограничения, фокус на простоте и автоматизации.
+
 ---
 
-# FK Integrity Checker
+## Инструмент для проверки ссылочной целостности в PostgreSQL
 
-Инструмент для проверки ссылочной целостности в PostgreSQL на основе внешних связей, заданных в YAML-файле. Не требует наличия объявленных `FOREIGN KEY` в схеме базы данных. Предназначен для валидации данных после миграций, загрузок или ETL-процессов.
+Этот инструмент позволяет проверить соответствие данных в связанных таблицах даже в отсутствие объявленных `FOREIGN KEY`. Он предназначен для использования при миграции, загрузке данных или аудите. Требует только Python и две библиотеки.
 
-## Требования
+### Требования
+- ОС: Ubuntu (или любая Linux-система с Python 3.7+)
+- Пакеты: `psycopg2`, `pyyaml`
 
-- Python 3.7+
-- Библиотеки: `psycopg2`, `pyyaml`
-
-Установка зависимостей:
+Установка:
 ```bash
 pip install psycopg2 pyyaml
 ```
 
-## Конфигурация
+---
 
-### 1. Файл правил: `fk_rules.yaml`
+### Шаг 1. Конфигурация: `fk_rules.yaml`
 
-Содержит список проверок в виде массива объектов. Каждый объект описывает связь между дочерней и родительской таблицами:
+Создайте файл `fk_rules.yaml` в рабочей директории. Каждое правило описывает связь между дочерней и родительской таблицами:
 
 ```yaml
 rules:
-  - child_table: orders
-    child_col: customer_id
-    parent_table: customers
-    parent_col: customer_id
-
   - child_table: order_details
     child_col: product_id
     parent_table: products
     parent_col: product_id
 
-  # ... остальные правила
+  - child_table: orders
+    child_col: customer_id
+    parent_table: customers
+    parent_col: id
+
+  - child_table: orders
+    child_col: employee_id
+    parent_table: employees
+    parent_col: employee_id
 ```
 
-Поддерживаются самоссылки (например, `employees.reports_to → employees.employee_id`). Значения `NULL` в дочерней колонке игнорируются.
+> Добавление новой проверки требует только добавления нового блока в этот файл.
 
-### 2. Подключение к БД
+---
 
-В скрипте `check_fk_integrity.py` задайте параметры подключения:
+### Шаг 2. Скрипт: `check_fk_integrity.py`
+
+Создайте файл `check_fk_integrity.py`:
 
 ```python
+#!/usr/bin/env python3
+"""
+Проверка ссылочной целостности по правилам из YAML.
+Зависимости: psycopg2, pyyaml
+"""
+
+import sys
+import yaml
+import psycopg2
+from typing import List, Dict
+
 DB_CONFIG = {
     'host': 'localhost',
     'port': 5432,
     'database': 'northwind',
     'user': 'postgres',
-    'password': 'your_password'
+    'password': 'postgres'
 }
+
+def load_rules(path: str) -> List[Dict]:
+    with open(path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)['rules']
+
+def build_query(rule: Dict) -> str:
+    ct = rule['child_table']
+    cc = rule['child_col']
+    pt = rule['parent_table']
+    pc = rule['parent_col']
+    return f"""
+        WITH missing_refs AS (
+            SELECT DISTINCT od.{cc} AS val
+            FROM {ct} od
+            LEFT JOIN {pt} p ON od.{cc} = p.{pc}
+            WHERE od.{cc} IS NOT NULL AND p.{pc} IS NULL
+        )
+        SELECT 
+            COUNT(*) AS broken,
+            ARRAY(SELECT val FROM missing_refs ORDER BY val LIMIT 10) AS sample_ids
+        FROM missing_refs;
+    """
+
+def main():
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    rules = load_rules('fk_rules.yaml')
+    violations = []
+
+    print("Проверка ссылочной целостности...\n")
+
+    for rule in rules:
+        desc = f"{rule['child_table']}.{rule['child_col']} → {rule['parent_table']}.{rule['parent_col']}"
+        print(f"Проверяю: {desc}")
+
+        cursor.execute(build_query(rule))
+        broken, sample = cursor.fetchone()
+
+        if broken > 0:
+            violations.append((desc, broken, sample))
+            print(f"  НАРУШЕНО: {broken} записей")
+            print(f"    Примеры: {sample}\n")
+        else:
+            print("  OK\n")
+
+    conn.close()
+
+    if violations:
+        print("\nНайдены нарушения ссылочной целостности:")
+        for desc, cnt, _ in violations:
+            print(f" - {desc}: {cnt} проблемных записей")
+        sys.exit(1)
+    else:
+        print("Все проверки пройдены. Целостность соблюдена.")
+
+if __name__ == '__main__':
+    main()
 ```
 
-Рекомендуется вынести чувствительные данные в переменные окружения или использовать `.pgpass`.
+---
 
-## Использование
+### Запуск
 
-Запуск:
-```bash
-python3 check_fk_integrity.py
-```
+1. Убедитесь, что PostgreSQL запущен (например, через Docker: `docker-compose up` в репозитории `northwind_psql`).
+2. При необходимости обновите `DB_CONFIG` под вашу БД.
+3. Выполните:
+   ```bash
+   python3 check_fk_integrity.py
+   ```
 
-Скрипт выполняет следующие действия:
-1. Читает правила из `fk_rules.yaml`.
-2. Для каждой связи формирует SQL-запрос, находящий значения в дочерней таблице, отсутствующие в родительской.
-3. Выводит результаты в консоль.
-4. При обнаружении нарушений завершается с кодом выхода `1`.
+---
 
-Пример вывода при нарушении:
-```
-Проверяю: orders.ship_via → shippers.shipper_id
-   НАРУШЕНО: 830 записей
-     Примеры: [1, 2, 3]
-```
+### Особенности
 
-При отсутствии нарушений:
-```
-✅ Все проверки пройдены. Целостность соблюдена.
-```
+- Поддерживает только одноколоночные связи.
+- Игнорирует `NULL` в дочерней колонке.
+- Возвращает до 10 примеров нарушенных значений.
+- При наличии нарушений завершается с кодом `1` — подходит для cron или CI.
 
-## Пример данных: Northwind
+---
 
-Для тестирования можно использовать образ Northwind для PostgreSQL:
+### Возможные доработки
 
-```bash
-git clone https://github.com/pthom/northwind_psql.git
-cd northwind_psql
-docker-compose up -d
-```
+- Поддержка составных ключей.
+- Вывод в JSON/CSV.
+- Интеграция с Airflow.
+- Чтение параметров подключения из `.env` или `.pgpass`.
 
-База данных будет доступна на `localhost:5432` с учётными данными по умолчанию:
-- БД: `northwind`
-- Пользователь: `postgres`
-- Пароль: `postgres`
-
-## Особенности реализации
-
-- Проверка выполняется через `LEFT JOIN ... WHERE parent_key IS NULL`.
-- Учитываются только ненулевые значения в дочерней колонке.
-- Возвращается до 10 примеров нарушенных значений для диагностики.
-- Подходит для автоматизации в CI/CD или cron-задачах.
-
-## Ограничения
-
-- Предполагается, что типы данных в связанных колонках совместимы.
-- Не проверяются составные внешние ключи.
-- Производительность зависит от наличия индексов по проверяемым колонкам.
-
---- 
-
-Этот инструмент не заменяет декларативные ограничения СУБД, но предоставляет способ верифицировать логическую целостность данных в средах, где такие ограничения отсутствуют или не могут быть применены.
+Готов адаптировать под вашу схему — пришлите список таблиц и колонок, и я подготовлю `fk_rules.yaml`.
